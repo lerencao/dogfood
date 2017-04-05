@@ -5,6 +5,7 @@ authors = ["Cao Jiafeng <funfriendcjf@gmail.com>"]
 
 [dependencies]
 fs2 = "0.4.1"
-
 bytebuffer = "0.2.1"
 skiplist = "*"
+
+crc = "^1.0.0"
