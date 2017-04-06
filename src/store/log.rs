@@ -205,8 +205,6 @@ impl Write for LogSegment {
 
 }
 
-// TODO(caojiafeng): impl Read for LogSegment
-
 trait PathExt {
     fn ls_files<F>(&self, preficate: F) -> io::Result<Vec<PathBuf>>
         where F: Fn(&Path) -> bool;
@@ -275,11 +273,16 @@ impl Log {
 
         let byte_in_use: u64 = segments_by_name.iter().fold(0u64, |acc, s| acc + s.1.capacity_in_bytes);
 
+        if total_capacity_in_bytes < byte_in_use {
+            panic!("total capacity is too small, cannot bootstrap the dir {}", data_dir);
+        }
+        let available_space = total_capacity_in_bytes - byte_in_use;
+
         Log {
             data_dir: data_dir.to_string(),
             capacity_in_bytes: total_capacity_in_bytes,
             segment_capacity_in_bytes: segment_capacity_in_bytes,
-            available_space_in_bytes: total_capacity_in_bytes - byte_in_use,
+            available_space_in_bytes: available_space,
             segments_by_name: segments_by_name,
         }
     }
@@ -294,6 +297,8 @@ impl Log {
 }
 
 impl Log {
+
+    // assume the write_size is less than segment_caiacity_in_bytes
     fn should_rollover(&self, write_size: u64) -> bool {
         self.active_segment().remaining_bytes() < write_size
     }
@@ -302,13 +307,19 @@ impl Log {
         // flush the current active segment
         self.active_segment_mut().flush()?;
 
-        // then create new segment and make it active
-        let segment_id = next_segment_id_pos(self.active_segment().id());
-        let filename = segment_id_to_filename(&segment_id);
-        let segment_file = fs::File::create(&filename).unwrap();
-        let segment = LogSegment::new(segment_id, self.segment_capacity_in_bytes, segment_file);
-        self.segments_by_name.insert(segment_id, segment);
-        Ok(())
+        if self.available_space_in_bytes < self.segment_capacity_in_bytes {
+            Err(io::Error::new(io::ErrorKind::Other, "no more space to spawn another segment"))
+        } else {
+            // then create new segment and make it active
+            let segment_id = next_segment_id_pos(self.active_segment().id());
+            let filename = segment_id_to_filename(&segment_id);
+            let segment_file = fs::File::create(&filename).unwrap();
+            let segment = LogSegment::new(segment_id, self.segment_capacity_in_bytes, segment_file);
+            self.segments_by_name.insert(segment_id, segment);
+
+            self.available_space_in_bytes = self.available_space_in_bytes - self.segment_capacity_in_bytes;
+            Ok(())
+        }
     }
 }
 
@@ -328,6 +339,4 @@ impl Write for Log {
 
 #[cfg(test)]
 mod test {
-    #[test]
-    fn test_read_dir() {}
 }
