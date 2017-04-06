@@ -7,11 +7,14 @@ use self::bytebuffer::ByteBuffer;
 extern crate crc;
 use self::crc::crc32;
 
+extern crate fs2;
+use self::fs2::FileExt;
+
 use std::fs;
 use std::io;
 use std::fmt;
 use std::io::prelude::*;
-use std::fs::File;
+use std::fs::{File, DirEntry};
 use std::path::{Path, PathBuf};
 use std::iter::Iterator;
 
@@ -87,10 +90,12 @@ impl LogSegment {
             file: file,
         };
         log_segment.allocate(capacity_in_bytes).unwrap();
+        log_segment.file.seek(io::SeekFrom::Start(0)).unwrap();
         log_segment.write_header().unwrap();
         log_segment
     }
 
+    // FIXME(caojiafeng): the endoffset should be set correctly.
     fn restore_from(
         id: SegmentId,
         segment_file: File,
@@ -158,7 +163,11 @@ impl LogSegment {
         if self.capacity_in_bytes > byte_size {
             Err(io::Error::new(io::ErrorKind::InvalidInput, "input byte_size is smaller than existed capacity size"))
         } else {
-            self.file.set_len(byte_size)
+            self.file.allocate(byte_size)?;
+            // self.file.set_len(byte_size)?;
+            // let pos = self.file.seek(io::SeekFrom::Start(0))?;
+            // assert_eq!(0, pos);
+            Ok(())
         }
     }
 
@@ -206,24 +215,25 @@ impl Write for LogSegment {
 }
 
 trait PathExt {
-    fn ls_files<F>(&self, preficate: F) -> io::Result<Vec<PathBuf>>
-        where F: Fn(&Path) -> bool;
+    fn ls_files<F>(&self, predicate: F) -> io::Result<Vec<DirEntry>>
+        where F: Fn(&DirEntry) -> bool;
 }
 
 impl PathExt for Path {
-    fn ls_files<F>(&self, predicate: F) -> io::Result<Vec<PathBuf>>
-        where F: Fn(&Path) -> bool {
+    fn ls_files<F>(&self, predicate: F) -> io::Result<Vec<DirEntry>>
+        where F: Fn(&DirEntry) -> bool {
         let read_dir = self.read_dir()?;
         read_dir.fold(Ok(vec![]), |seq_result, entry_result| {
             seq_result.and_then(|mut seq| entry_result.map(|entry| {
-                if predicate(entry.path().as_path()) {
-                    seq.push(entry.path());
+                if predicate(&entry) {
+                    seq.push(entry);
                 }
                 seq
             }))
         })
     }
 }
+
 
 
 pub struct Log {
@@ -244,24 +254,35 @@ impl Log {
         fs::create_dir_all(data_dir).unwrap();
 
         let path = Path::new(data_dir);
-        let segment_files: Vec<PathBuf> =
-            path.ls_files(|x| x.ends_with(LOG_SUFFIX)).unwrap();
+        let segment_paths: Vec<PathBuf> = path
+            .ls_files(|x| x.file_name().to_str().unwrap().ends_with(LOG_SUFFIX))
+            .unwrap()
+            .iter()
+            .map(|dir_entry| dir_entry.path())
+            .collect();
 
         let mut segments_by_name = SkipMap::<SegmentId, LogSegment>::new();
 
-        if segment_files.is_empty() {
+        if segment_paths.is_empty() {
             // create first segment
             let segment_id = SegmentId { pos: 0, gen: 0 };
             let filename = segment_id_to_filename(&segment_id);
-            let segment_file = fs::File::create(&filename).unwrap();
+            let segment_file = fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&path.join(&filename))
+                .unwrap();
             let segment = LogSegment::new(segment_id, segment_capacity_in_bytes, segment_file);
             segments_by_name.insert(segment_id, segment);
         } else {
             // load from segment files
-            for segment_path in &segment_files {
-                let filename = segment_path.to_str().unwrap();
-                let segment_file = fs::File::create(filename).unwrap();
-                let segment_id = segment_id_from_filename(filename);
+            for segment_path in &segment_paths {
+                let segment_file = fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(&segment_path)
+                    .unwrap();
+                let segment_id = segment_id_from_filename(segment_path.file_name().and_then(|n| n.to_str()).unwrap());
                 let segment = LogSegment::restore_from(
                     segment_id,
                     segment_file
@@ -339,4 +360,23 @@ impl Write for Log {
 
 #[cfg(test)]
 mod test {
+    use super::Log;
+    use std::env;
+    use std::fs::{self, DirEntry};
+    use std::io::prelude::*;
+    use super::PathExt;
+
+    #[test]
+    fn test_ls_files() {
+        let tmp_dir = env::temp_dir().join("test_ls_files");
+        fs::create_dir(&tmp_dir).unwrap();
+
+        fs::File::create(&tmp_dir.join("0_log")).unwrap();
+
+        let segment_files: Vec<DirEntry> =
+            tmp_dir.ls_files(|x| true).unwrap();
+        assert_eq!(segment_files.len(), 1);
+
+        fs::remove_dir_all(&tmp_dir).unwrap();
+    }
 }
